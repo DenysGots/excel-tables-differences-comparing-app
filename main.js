@@ -400,7 +400,6 @@ function diffTables(a, b, resolveName) {
     }
   }
 
-  // TODO: narrow the result onlyA and onlyB using mapA and mapB and fuse library
   return { onlyA, onlyB, matchedCount };
 }
 
