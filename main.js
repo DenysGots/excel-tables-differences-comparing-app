@@ -9,6 +9,8 @@
  * Usage:
  *   npm install exceljs
  *   node main.js file1.xlsx file2.xlsx output.xlsx
+ * OR, for fastre computing:
+ *   UV_THREADPOOL_SIZE=12 node --max-old-space-size=16384 main.js file1.xlsx file2.xlsx output.xlsx
  *
  * With environment overrides:
  *   PRICE_DECIMALS=2 BALANCE_TOLERANCE=1 node main.js file1.xlsx file2.xlsx output.xlsx
@@ -18,6 +20,96 @@ const fs = require("fs");
 const path = require("path");
 const ExcelJS = require("exceljs");
 const Fuse = require('fuse.js')
+
+const PROGRESS_BAR_WIDTH = 28;
+const PIPELINE_STAGES = 10;
+
+function formatDuration(ms) {
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.round(seconds % 60)}s`;
+}
+
+function renderProgressBar(current, total) {
+  const ratio = total <= 0 ? 1 : Math.min(1, Math.max(0, current / total));
+  const pct = Math.round(ratio * 100);
+  const filled = Math.round(ratio * PROGRESS_BAR_WIDTH);
+  return {
+    pct,
+    bar: `${'█'.repeat(filled)}${'░'.repeat(PROGRESS_BAR_WIDTH - filled)}`,
+  };
+}
+
+function createProgress(label, total) {
+  const start = Date.now();
+  let current = 0;
+  let lastDrawnPct = -1;
+  let lastDrawnAt = 0;
+  const tty = Boolean(process.stdout.isTTY);
+  const safeTotal = Math.max(0, Number(total) || 0);
+
+  function draw(force = false) {
+    const { pct, bar } = renderProgressBar(current, safeTotal);
+    const now = Date.now();
+    if (!force && pct === lastDrawnPct && now - lastDrawnAt < 80) return;
+    if (!tty && !force && pct < 100 && pct - lastDrawnPct < 10) return;
+    lastDrawnPct = pct;
+    lastDrawnAt = now;
+    const line = `${label} [${bar}] ${pct}%  ${current}/${safeTotal}  ${formatDuration(now - start)}`;
+    if (tty) {
+      process.stdout.write(`\r${line}\x1b[K`);
+      if (current >= safeTotal) process.stdout.write('\n');
+    } else {
+      console.log(line);
+    }
+  }
+
+  return {
+    update(value) {
+      current = Math.min(safeTotal, Math.max(0, value));
+      draw(current >= safeTotal);
+    },
+    tick(n = 1) {
+      current = Math.min(safeTotal, current + n);
+      draw(current >= safeTotal);
+    },
+    done() {
+      if (current >= safeTotal && lastDrawnPct === 100) return;
+      current = safeTotal;
+      draw(true);
+    },
+  };
+}
+
+function startStage(stage, title) {
+  console.log(`\n[${stage}/${PIPELINE_STAGES}] ${title}`);
+}
+
+async function withSpinner(label, work) {
+  const start = Date.now();
+  const tty = Boolean(process.stdout.isTTY);
+  if (!tty) {
+    console.log(`${label}...`);
+    const result = await work();
+    console.log(`${label} done  ${formatDuration(Date.now() - start)}`);
+    return result;
+  }
+
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let frame = 0;
+  const timer = setInterval(() => {
+    process.stdout.write(`\r${frames[frame % frames.length]} ${label}  ${formatDuration(Date.now() - start)}\x1b[K`);
+    frame += 1;
+  }, 80);
+
+  try {
+    return await work();
+  } finally {
+    clearInterval(timer);
+    process.stdout.write(`\r${label} done  ${formatDuration(Date.now() - start)}\x1b[K\n`);
+  }
+}
 
 // Diff configuration (overridable via env)
 const PRICE_DECIMALS = Number(process.env.PRICE_DECIMALS || 2);
@@ -83,20 +175,24 @@ function validateInputFile(filePath) {
  * @param {string} filePath - Path to the XLSX file
  * @returns {Promise<Array<Array<any>>>} - 2D array of cell values
  */
-async function readXlsxAsArray(filePath) {
+async function readXlsxAsArray(filePath, progressLabel) {
   const workbook = new ExcelJS.Workbook();
-  await workbook.xlsx.readFile(filePath);
+  await withSpinner(`Loading ${path.basename(filePath)}`, () => workbook.xlsx.readFile(filePath));
 
   const worksheet = workbook.worksheets[0]; // Get first worksheet
   const data = [];
+  const rowCount = worksheet.actualRowCount || worksheet.rowCount || 0;
+  const progress = createProgress(progressLabel || `Parsing ${path.basename(filePath)}`, rowCount);
 
-  worksheet.eachRow((row, rowNumber) => {
+  worksheet.eachRow((row) => {
     const rowData = [];
     row.eachCell((cell, colNumber) => {
       rowData[colNumber - 1] = convertExcelValue(cell.value);
     });
     data.push(rowData);
+    progress.tick();
   });
+  progress.done();
 
   return data;
 }
@@ -130,10 +226,16 @@ function normalizeItem(item) {
     [/э/gi, "e"],
     [/у/gi, "y"],
     [/р/gi, "p"],
-    [/а/gi, "A"],
-    [/х/gi, "X"],
-    [/к/gi, "K"],
-    [/в/gi, "B"]
+    [/p/gi, "r"],
+    [/а/gi, "a"],
+    [/х/gi, "x"],
+    [/к/gi, "k"],
+    [/в/gi, "b"],
+    [/л/gi, "l"],
+    [/т/gi, "t"],
+    [/5/gi, "s"],
+    [/м/gi, "m"],
+    [/о/gi, "o"]
   ];
 
   return rules.reduce((text, [pattern, replacement]) => {
@@ -148,7 +250,7 @@ function normalizeItem(item) {
  */
 function createSimplifiedName(name) {
   if (!name || typeof name !== 'string') return '';
-  const normalizedName = name.split(' ').sort().join(' ').replace(/[xX\/\\'"?._=|*:;~!@#№$%&()+`,\s\t\r–-]/gi, '').toLowerCase();
+  const normalizedName = name.split('').sort().join(' ').replace(/[xX\/\\'"?._=|*:;~!@#№$%&()+`,\s\t\r–-]/gi, '').toLowerCase();
 
   return normalizeItem(normalizedName);
 }
@@ -162,19 +264,32 @@ function buildNameVocabulary(allNames) {
   const uniqueEntries = [];
   const seenSimplified = new Set();
 
+  const vocabProgress = createProgress('Building name vocabulary', allNames.length);
   allNames.forEach(name => {
-    if (!name || typeof name !== 'string') return;
+    if (!name || typeof name !== 'string') {
+      vocabProgress.tick();
+      return;
+    }
     const simplified = createSimplifiedName(name);
-    if (!simplified) return;
-    if (seenSimplified.has(simplified)) return;
+    if (!simplified) {
+      vocabProgress.tick();
+      return;
+    }
+    if (seenSimplified.has(simplified)) {
+      vocabProgress.tick();
+      return;
+    }
     uniqueEntries.push({
       original: name,
       simplified,
       simplifiedWithSpaces: createSimplifiedNameWithSpaces(name),
     });
     seenSimplified.add(simplified);
+    vocabProgress.tick();
   });
+  vocabProgress.done();
 
+  console.log(`Indexing ${uniqueEntries.length} unique names with Fuse...`);
   const fuseInstance = new Fuse(uniqueEntries, {
     includeScore: true,
     threshold: 0.3,
@@ -183,8 +298,12 @@ function buildNameVocabulary(allNames) {
 
   const canonicalMap = new Map();
 
+  const matchProgress = createProgress('Matching similar names', uniqueEntries.length);
   uniqueEntries.forEach(entry => {
-    if (canonicalMap.has(entry.simplified)) return;
+    if (canonicalMap.has(entry.simplified)) {
+      matchProgress.tick();
+      return;
+    }
     canonicalMap.set(entry.simplified, entry.simplified);
     const matches = fuseInstance.search(entry.simplified);
     matches.forEach(result => {
@@ -194,7 +313,9 @@ function buildNameVocabulary(allNames) {
         canonicalMap.set(result.item.simplified, entry.simplified);
       }
     });
+    matchProgress.tick();
   });
+  matchProgress.done();
 
   const resolveName = (name) => {
     if (!name || typeof name !== 'string') return '';
@@ -292,8 +413,9 @@ function objectsToArray(objects, headers) {
  * @param {Array<Object>} tableData - Array of objects representing table rows
  * @returns {Array<Object>} - Summarized table data
  */
-function summarizeTable(tableData, resolveName) {
+function summarizeTable(tableData, resolveName, progressLabel) {
   const summaryMap = new Map();
+  const progress = createProgress(progressLabel || 'Summarizing rows', tableData.length);
 
   tableData.forEach(row => {
     const simplifiedName = resolveName(row['Найменування']);
@@ -326,7 +448,9 @@ function summarizeTable(tableData, resolveName) {
       }
       summaryMap.set(key, newRow);
     }
+    progress.tick();
   });
+  progress.done();
 
   return Array.from(summaryMap.values());
 }
@@ -370,27 +494,34 @@ function buildKeyNameAndRoundedPrice(row, resolveName) {
 function diffTables(a, b, resolveName) {
   // Build map for B: key -> array of rows
   const mapB = new Map();
+  const indexProgress = createProgress('Indexing table 2 for diff', b.length);
   b.forEach(row => {
     const key = buildKeyNameAndRoundedPrice(row, resolveName);
     const arr = mapB.get(key) || [];
     arr.push(row);
     mapB.set(key, arr);
+    indexProgress.tick();
   });
+  indexProgress.done();
 
   let matchedCount = 0;
   const onlyA = [];
+  const matchProgress = createProgress('Diffing table 1 against table 2', a.length);
 
   a.forEach(rowA => {
     const key = buildKeyNameAndRoundedPrice(rowA, resolveName);
     const candidates = mapB.get(key);
     if (!candidates || candidates.length === 0) {
       onlyA.push(rowA);
+      matchProgress.tick();
       return;
     }
     // Exact match found, remove it
     candidates.splice(0, 1);
     matchedCount += 1;
+    matchProgress.tick();
   });
+  matchProgress.done();
 
   // Remaining rows in mapB are onlyB
   const onlyB = [];
@@ -400,6 +531,7 @@ function diffTables(a, b, resolveName) {
     }
   }
 
+  // TODO: narrow the result onlyA and onlyB using mapA and mapB and fuse library
   return { onlyA, onlyB, matchedCount };
 }
 
@@ -412,22 +544,26 @@ function diffTables(a, b, resolveName) {
 async function writeCombinedAndSummary(combinedData, summaryRows, filePath) {
   const workbook = new ExcelJS.Workbook();
   const wsCombined = workbook.addWorksheet('Combined');
+  const writeProgress = createProgress('Writing worksheet cells', combinedData.length + summaryRows.length);
   combinedData.forEach((row, rowIndex) => {
     row.forEach((cellValue, colIndex) => {
       if (cellValue !== undefined && cellValue !== '') {
         wsCombined.getCell(rowIndex + 1, colIndex + 1).value = cellValue;
-        }
-      });
+      }
     });
+    writeProgress.tick();
+  });
 
   const wsSummary = workbook.addWorksheet('Summary');
   summaryRows.forEach((row, rowIndex) => {
     row.forEach((cellValue, colIndex) => {
       wsSummary.getCell(rowIndex + 1, colIndex + 1).value = cellValue;
     });
+    writeProgress.tick();
   });
+  writeProgress.done();
 
-  await workbook.xlsx.writeFile(filePath);
+  await withSpinner(`Saving ${path.basename(filePath)}`, () => workbook.xlsx.writeFile(filePath));
 }
 
 /**
@@ -487,37 +623,35 @@ async function main() {
     validateInputFile(file1Path);
     validateInputFile(file2Path);
 
-    console.log(`Reading first Excel file: ${file1Path}`);
-    console.log(`Reading second Excel file: ${file2Path}`);
     console.log(`Output will be saved to: ${outputPath}`);
 
-    // Read both files as arrays
-    const table1Raw = await readXlsxAsArray(file1Path);
-    const table2Raw = await readXlsxAsArray(file2Path);
+    startStage(1, `Reading ${path.basename(file1Path)}`);
+    const table1Raw = await readXlsxAsArray(file1Path, `Parsing ${path.basename(file1Path)}`);
+    startStage(2, `Reading ${path.basename(file2Path)}`);
+    const table2Raw = await readXlsxAsArray(file2Path, `Parsing ${path.basename(file2Path)}`);
 
     console.log(`Raw Table 1 dimensions: ${table1Raw.length} rows x ${table1Raw.length > 0 ? table1Raw[0].length : 0} columns`);
     console.log(`Raw Table 2 dimensions: ${table2Raw.length} rows x ${table2Raw.length > 0 ? table2Raw[0].length : 0} columns`);
 
-    // Convert to objects for easier processing
+    startStage(3, 'Converting rows and normalizing balances');
     let table1Objects = arrayToObjects(table1Raw);
     let table2Objects = arrayToObjects(table2Raw);
-
-    // Normalize monetary fields and recalc balances upfront
     table1Objects = normalizeAndRecalc(table1Objects);
     table2Objects = normalizeAndRecalc(table2Objects);
 
     console.log(`Table 1 data rows: ${table1Objects.length}`);
     console.log(`Table 2 data rows: ${table2Objects.length}`);
 
+    startStage(4, 'Building fuzzy name map');
     const allNames = [...table1Objects, ...table2Objects].map(row => row['Найменування']).filter(Boolean);
     const { resolveName, fuseInstance } = buildNameVocabulary(allNames);
     fuse = fuseInstance;
 
-    // Summarize both tables
-    const summarizedTable1 = summarizeTable(table1Objects, resolveName);
-    const summarizedTable2 = summarizeTable(table2Objects, resolveName);
+    startStage(5, 'Summarizing tables');
+    const summarizedTable1 = summarizeTable(table1Objects, resolveName, 'Summarizing table 1');
+    const summarizedTable2 = summarizeTable(table2Objects, resolveName, 'Summarizing table 2');
 
-    // Filter out rows with empty/zero "Сума з Залишки"
+    startStage(6, 'Filtering empty balances');
     const filteredTable1 = filterRowsWithNonEmptyBalance(summarizedTable1);
     const filteredTable2 = filterRowsWithNonEmptyBalance(summarizedTable2);
 
@@ -526,7 +660,7 @@ async function main() {
     console.log(`Filtered Table 1 rows (non-empty balance): ${filteredTable1.length}`);
     console.log(`Filtered Table 2 rows (non-empty balance): ${filteredTable2.length}`);
 
-    // Diff: leave only items that are different in each table
+    startStage(7, 'Diffing tables');
     const { onlyA: onlyTable1, onlyB: onlyTable2 } = diffTables(filteredTable1, filteredTable2, resolveName);
     console.log(`Only in Table 1 after diff: ${onlyTable1.length}`);
     console.log(`Only in Table 2 after diff: ${onlyTable2.length}`);
@@ -550,13 +684,13 @@ async function main() {
     if (table1HasSource && !headers1.includes(sourceField)) headers1.push(sourceField);
     if (table2HasSource && !headers2.includes(sourceField)) headers2.push(sourceField);
 
+    startStage(8, 'Building output tables');
     const table1 = objectsToArray(onlyTable1, headers1);
     const table2 = objectsToArray(onlyTable2, headers2);
 
     console.log(`Final Table 1 dimensions: ${table1.length} rows x ${table1.length > 0 ? table1[0].length : 0} columns`);
     console.log(`Final Table 2 dimensions: ${table2.length} rows x ${table2.length > 0 ? table2[0].length : 0} columns`);
 
-    // Combine tables side by side
     const combinedData = combineTablesSideBySide(table1, table2, path.basename(file1Path), path.basename(file2Path));
 
     console.log(`Combined table dimensions: ${combinedData.length} rows x ${combinedData.length > 0 ? combinedData[0].length : 0} columns`);
@@ -574,8 +708,9 @@ async function main() {
       ['Only in after diff', onlyTable1.length, onlyTable2.length],
     ];
 
-    // Write combined data and summary to new XLSX file
+    startStage(9, 'Writing combined workbook');
     await writeCombinedAndSummary(combinedData, summaryRows, outputPath);
+    startStage(10, 'Done');
 
     console.log(`Successfully combined tables and summary saved to: ${outputPath}`);
 
